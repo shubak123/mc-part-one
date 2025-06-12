@@ -1,0 +1,274 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <U8g2lib.h>
+
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// Клавіатура
+#define R1 17
+#define R2 16
+#define C1 14
+#define C2 27
+#define C3 26
+#define C4 25
+#define C5 33
+
+
+#define CLK     18
+#define DT      19
+#define SW      5
+#define statusLed 2
+
+
+const int rowPins[2] = {R1, R2};
+const int colPins[5] = {C1, C2, C3, C4, C5};
+const int keys[2][5] = {
+  {0, 1, 2, 3, 4},
+  {5, 6, 7, 8, 9}
+};
+
+int customKey[3][10] = {
+  {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'},
+  {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
+  {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';'}
+};
+
+
+WebServer server(80);
+int layout = 0;
+
+
+enum Menu { MENU_PONG, MENU_LAYOUT };
+Menu currentMenu = MENU_PONG;
+
+
+int ballX = 64, ballY = 32;
+int ballDX = 1, ballDY = 1;
+int paddleY = 24;
+const int pongScreenHeight = 64;
+const int paddleHeight = 16;
+
+int encoderPosition = 0;
+int lastEncoderPosition = 0;
+int lastCLK = HIGH;
+int lastDT = HIGH;
+
+unsigned long timer = 0;
+
+void logKey(char keyChar) {
+  File file = SPIFFS.open("/adv_0.csv", FILE_APPEND);
+  if (!file) {
+    Serial.println("Не вдалося відкрити файл для запису");
+    return;
+  }
+  String line = String(millis()) + "," + keyChar + "\n";
+  file.print(line);
+  file.close();
+}
+
+void handleLogPage() {
+  File file = SPIFFS.open("/adv_0.csv", FILE_READ);
+  if (!file) {
+    server.send(500, "text/plain", "Не вдалося відкрити файл.");
+    return;
+  }
+
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Log</title></head><body>";
+  html += "<h2>Кнопки</h2><table border='1'><tr><th>Час</th><th>Клавіша</th></tr>";
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      String t = line.substring(0, comma);
+      String k = line.substring(comma + 1);
+      html += "<tr><td>" + t + "</td><td>" + k + "</td></tr>";
+    }
+  }
+  html += "</table></body></html>";
+  server.send(200, "text/html", html);
+  file.close();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(statusLed, OUTPUT);
+  pinMode(CLK, INPUT_PULLUP);
+  pinMode(DT, INPUT_PULLUP);
+  pinMode(SW, INPUT_PULLUP);
+
+  for (int i = 0; i < 2; i++) pinMode(rowPins[i], INPUT_PULLDOWN);
+  for (int i = 0; i < 5; i++) {
+    pinMode(colPins[i], OUTPUT);
+    digitalWrite(colPins[i], LOW);
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 10);
+  display.print("Serial Keyboard");
+  display.display();
+
+  u8g2.begin();
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    return;
+  }
+
+  WiFi.softAP("ESP32_Keyboard", "12345678");
+  Serial.println("Access Point Started");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, []() {
+    String html = "<h2>Select Layout</h2><form action='/set'>";
+    html += "<input type='radio' name='layout' value='0'> Layout 1<br>";
+    html += "<input type='radio' name='layout' value='1'> Layout 2<br>";
+    html += "<input type='radio' name='layout' value='2'> Layout 3<br>";
+    html += "<input type='submit' value='Set Layout'></form>";
+    html += "<br><a href='/log'>Log</a>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/set", HTTP_GET, []() {
+    if (server.hasArg("layout")) {
+      layout = server.arg("layout").toInt();
+    }
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/log", HTTP_GET, handleLogPage);
+  server.begin();
+
+  lastCLK = digitalRead(CLK);
+  lastDT = digitalRead(DT);
+}
+
+void readEncoder() {
+  int currentCLK = digitalRead(CLK);
+  int currentDT = digitalRead(DT);
+
+  if (currentCLK != lastCLK && currentCLK == LOW) {
+    if (currentDT != currentCLK) {
+      encoderPosition++;
+    } else {
+      encoderPosition--;
+      if (encoderPosition < 0) encoderPosition = 0;
+    }
+
+    if (currentMenu == MENU_LAYOUT) {
+      layout = encoderPosition % 3;
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.setTextSize(1);
+      display.print("Layout: ");
+      display.print(layout + 1);
+      display.display();
+    } else if (currentMenu == MENU_PONG) {
+      if (currentDT != currentCLK) {
+        paddleY += 2;
+      } else {
+        paddleY -= 2;
+      }
+      // межі екрану
+        if (paddleY < 0) paddleY = 0;
+        if (paddleY > 56) paddleY = 56;  // враховано висоту ракетки 8px
+
+        lastEncoderPosition = encoderPosition;
+    }
+
+    delay(30); // антидребезг
+  }
+
+  lastCLK = currentCLK;
+  lastDT = currentDT;
+}
+
+void loop() {
+  server.handleClient();
+
+  if (digitalRead(SW) == LOW) {
+    delay(250);
+    currentMenu = static_cast<Menu>((currentMenu + 1) % 2);
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.print(currentMenu == MENU_PONG ? "Pong" : "Layout");
+    display.display();
+  }
+
+  readEncoder();
+
+  if (currentMenu == MENU_PONG) {
+    u8g2.firstPage();
+    do {
+      u8g2.drawFrame(0, 0, 128, 64);
+      u8g2.drawBox(2, paddleY, 4, paddleHeight);
+      u8g2.drawDisc(ballX, ballY, 2);
+    } while (u8g2.nextPage());
+
+    ballX += ballDX;
+    ballY += ballDY;
+
+    if (ballY <= 1 || ballY >= pongScreenHeight - 2) {
+      ballDY = -ballDY;
+    }
+
+    if (ballX <= 7 && ballY >= paddleY && ballY <= paddleY + paddleHeight) {
+      ballDX = -ballDX;
+    }
+
+    if (ballX >= 126) {
+      ballDX = -ballDX;
+    }
+
+    if (ballX <= 0) {
+      ballX = 64;
+      ballY = 32;
+    }
+
+    delay(20);
+  }
+
+  if (millis() - timer > 10) {
+    timer = millis();
+    int key = getKey();
+    if (key != -1) {
+      char keyChar = customKey[layout][key];
+      
+      Serial.println(keyChar);
+      digitalWrite(statusLed, HIGH);
+      logKey(keyChar);
+      delay(100);
+      digitalWrite(statusLed, LOW);
+    }
+  }
+}
+
+int getKey() {
+  for (int c = 0; c < 5; c++) {
+    digitalWrite(colPins[c], HIGH);
+    delayMicroseconds(100);
+    for (int r = 0; r < 2; r++) {
+      if (digitalRead(rowPins[r]) == HIGH) {
+        digitalWrite(colPins[c], LOW);
+        return keys[r][c];
+      }
+    }
+    digitalWrite(colPins[c], LOW);
+  }
+  return -1;
+}
